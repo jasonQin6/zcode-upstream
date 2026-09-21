@@ -83,7 +83,10 @@ export async function runZCodeProtocolAgent(
   options: RunZCodeProtocolAgentOptions = {},
 ): Promise<void> {
   if (options.prepareStorageOnly) {
-    const config = createConfig({ env: options.env });
+    const config = createConfig({
+      env: options.env,
+      ...(options.userConfigPath !== undefined ? { userConfigPath: options.userConfigPath } : {}),
+    });
     await prepareProtocolStartupStorage({
       dbPath: getSessionDbPath(config, options.cwd),
       input: options.input ?? process.stdin,
@@ -135,7 +138,10 @@ export async function runZCodeProtocolAgent(
     | undefined;
   try {
     // 数据库准备先于账号、Registry 和遥测，不把远端材料等待混进迁移门禁。
-    const configResult = createConfig({ env: options.env });
+    const configResult = createConfig({
+      env: options.env,
+      ...(options.userConfigPath !== undefined ? { userConfigPath: options.userConfigPath } : {}),
+    });
     sessionStore = await acquireProtocolStartupResource({
       signal: options.lifecycle?.signal,
       logger,
@@ -156,7 +162,26 @@ export async function runZCodeProtocolAgent(
     providerRegistryRuntime = await acquireProtocolStartupResource({
       signal: options.lifecycle?.signal,
       logger,
-      create: () => startProcessProviderRegistryRuntime(runtimeEnv),
+      // --standalone-providers：headless 调用方（如外部 ACP 客户端）没有 Desktop Host
+      // 回答 interaction/requestProviderRuntimeHeaders，也没有 Host 推送的账号配置。
+      // 复用 headless --prompt 同一条 standalone 通路：本进程 credentialStore 物化
+      // account provider、导入 legacy CLI 静态 provider、用本地 headers port 认证。
+      // Desktop 托管路径不传该选项，行为逐字不变（syncAccountProviderConfig 照常接收）。
+      create: () =>
+        startProcessProviderRegistryRuntime(
+          runtimeEnv,
+          options.standaloneProviders
+            ? {
+                standalone: {
+                  // --settings 同时约束 createConfig 与 legacy provider 导入，两个读取点
+                  // 的默认值同为 getDefaultConfigPath()，覆盖时必须一起偏移。
+                  ...(options.userConfigPath !== undefined
+                    ? { legacyCliUserConfigFilePath: options.userConfigPath }
+                    : {}),
+                },
+              }
+            : {},
+        ),
       disposeLate: (runtime) => runtime.dispose(),
     });
     options.lifecycle?.signal.throwIfAborted();
@@ -280,6 +305,14 @@ export async function runZCodeProtocolAgent(
           sourceTitle: "electron",
           onToolExecResource: (params) =>
             connection.send({ method: zcodeProtocolNotifications.toolExecResource, params }),
+          // standalone 模式下账号认证由本地 credentialStore 回答；该字段位于 appOptions
+          // 展开之后，优先于 workspace-model-runtime 兜底创建的反向调用 port。
+          ...(options.standaloneProviders && activeProviderRegistryRuntime.providerRuntimeHeadersPort
+            ? {
+                providerRuntimeHeadersPort:
+                  activeProviderRegistryRuntime.providerRuntimeHeadersPort,
+              }
+            : {}),
         }),
       cwd: options.cwd,
       env: options.env,

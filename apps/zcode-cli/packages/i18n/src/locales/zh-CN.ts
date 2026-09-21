@@ -42,9 +42,14 @@ export const zhCN: ZCodeCopy = {
   --force-mcs      对 Anthropic provider 强制启用 mid-conversation system 投影
   --locale <locale>  UI 语言：en-US、zh-CN 或 auto
   --mode <mode>    prompt 权限模式：build、edit、plan 或 yolo（--prompt 默认 yolo）
+  --model <model>  钉定本次运行的模型：<providerId>/<modelId> 或 main（仅 --prompt/--target）
+  --max-turns <n>  headless 运行的回合上限，达到后按取消收尾（仅 --prompt/--target）
   --resume <sessionId>  按 sessionId 恢复持久化 session（sess_...）
   --target <text>  在 headless 模式运行或设置 session goal
   --target-replace 替换 --target 已存在的 goal
+  --settings <path>  app-server 覆盖用户配置文件路径（默认 ~/.zcode/cli/config.json）
+  --standalone-providers  app-server 由本进程管理 provider 凭据（credentialStore + 旧配置
+                    静态 provider 导入），不依赖 Desktop Host 的账号推送与反向认证
   -c, --continue        恢复当前目录最近的 session
   --json           在支持的命令中输出机器可读 JSON
   --no-browser     不打开浏览器，只打印 OAuth URL

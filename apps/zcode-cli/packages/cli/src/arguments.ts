@@ -67,6 +67,18 @@ export const parseGlobalArgs = (argv: string[]) =>
       mode: {
         type: "string",
       },
+      model: {
+        type: "string",
+      },
+      "max-turns": {
+        type: "string",
+      },
+      settings: {
+        type: "string",
+      },
+      "standalone-providers": {
+        type: "boolean",
+      },
       verbose: {
         type: "boolean",
       },

@@ -742,6 +742,14 @@ export interface RunZCodeProtocolAgentOptions {
   output?: NodeJS.WritableStream;
   presentationSurface?: PresentationSurface;
   version?: string;
+  /** CLI `--settings` 传入：覆盖 createConfig 的用户配置文件路径（默认 ~/.zcode/cli/config.json）。 */
+  userConfigPath?: string;
+  /**
+   * CLI `--standalone-providers` 传入：app-server 由本进程管理账号凭据与旧配置导入
+   * （credentialStore + legacy 导入 + 本地 runtime headers port），不再依赖 Desktop Host
+   * 的 syncAccountProviderConfig / interaction 反向调用。Desktop 托管路径不得开启。
+   */
+  standaloneProviders?: boolean;
 }
 
 export interface ListZCodeSessionsOptions {

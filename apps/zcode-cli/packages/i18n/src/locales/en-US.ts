@@ -42,9 +42,14 @@ Options:
   --force-mcs      Force mid-conversation system projection for Anthropic providers
   --locale <locale>  UI locale: en-US, zh-CN, or auto
   --mode <mode>    Permission mode for prompts: build, edit, plan, or yolo (default: yolo for --prompt)
+  --model <model>  Pin the model for this run: <providerId>/<modelId> or main (--prompt/--target only)
+  --max-turns <n>  Cap headless runs at N completed turns, then stop as cancelled (--prompt/--target only)
   --resume <sessionId>  Resume a persisted session by sessionId (sess_...)
   --target <text>  Run or set the session goal in headless mode
   --target-replace Replace any existing session goal set by --target
+  --settings <path>  Override the user config file path for app-server (default ~/.zcode/cli/config.json)
+  --standalone-providers  app-server manages provider credentials in-process (credentialStore +
+                    legacy static provider import), no Desktop Host account push or reverse auth
   -c, --continue        Resume the latest session for the current directory
   --json           Print machine-readable JSON where supported
   --no-browser     Print the OAuth URL without opening a browser

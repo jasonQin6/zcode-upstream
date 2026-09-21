@@ -51,6 +51,13 @@ const BROWSER_USE_SCOPE_ERROR =
 const SURFACE_SCOPE_ERROR =
   "--surface can only be used with --prompt, --target, app-server, or agent-server.";
 const MEMORY_BENCH_SCOPE_ERROR = "--memory-bench can only be used with -p/--prompt.";
+const MODEL_SCOPE_ERROR = "--model can only be used with --prompt or --target.";
+const MODEL_FORMAT_ERROR = '--model expects "main" or "<providerId>/<modelId>".';
+const MAX_TURNS_SCOPE_ERROR = "--max-turns can only be used with --prompt or --target.";
+const MAX_TURNS_INVALID_ERROR = "--max-turns requires a positive integer.";
+const SETTINGS_SCOPE_ERROR = "--settings can only be used with app-server or agent-server.";
+const STANDALONE_PROVIDERS_SCOPE_ERROR =
+  "--standalone-providers can only be used with app-server or agent-server.";
 
 const pluginsCommandFlags = (
   values: ReturnType<typeof parseGlobalArgs>["values"],
@@ -236,6 +243,8 @@ const runZCodeProtocolCommand = async (
   deps: RunDependencies,
   presentationSurface: PresentationSurface,
   prepareStorageOnly = false,
+  settingsPath?: string,
+  standaloneProviders = false,
 ): Promise<number> => {
   try {
     const env = prepareCliRuntimeEnv(deps.env ?? process.env);
@@ -271,6 +280,8 @@ const runZCodeProtocolCommand = async (
       presentationSurface,
       prepareStorageOnly,
       version,
+      ...(settingsPath !== undefined ? { userConfigPath: settingsPath } : {}),
+      ...(standaloneProviders ? { standaloneProviders: true } : {}),
     });
     return 0;
   } catch (error) {
@@ -457,6 +468,52 @@ export const run = async (ctx: RunContext, deps: RunDependencies = {}): Promise<
     return 1;
   }
 
+  // --model / --max-turns 只对 headless 一次性运行有意义；--settings 只覆盖 app-server 的
+  // 配置文件路径。逐旗标收窄作用域，避免语义漂移到 tui / plugin 等命令。
+  const isHeadlessRunInvocation =
+    typeof parsed.values.prompt === "string" || targetRequest !== undefined;
+  const modelSelection = parsed.values.model as string | undefined;
+  if (modelSelection !== undefined) {
+    if (!isHeadlessRunInvocation) {
+      ctx.stderr.write(`${MODEL_SCOPE_ERROR}\n`);
+      return 1;
+    }
+    if (modelSelection !== "main" && !modelSelection.includes("/")) {
+      ctx.stderr.write(`${MODEL_FORMAT_ERROR}\n`);
+      return 1;
+    }
+  }
+  const maxTurnsRaw = parsed.values["max-turns"] as string | undefined;
+  let maxTurns: number | undefined;
+  if (maxTurnsRaw !== undefined) {
+    if (!isHeadlessRunInvocation) {
+      ctx.stderr.write(`${MAX_TURNS_SCOPE_ERROR}\n`);
+      return 1;
+    }
+    const normalizedTurns = Number.parseInt(maxTurnsRaw, 10);
+    if (!/^\d+$/.test(maxTurnsRaw.trim()) || normalizedTurns <= 0) {
+      ctx.stderr.write(`${MAX_TURNS_INVALID_ERROR}\n`);
+      return 1;
+    }
+    maxTurns = normalizedTurns;
+  }
+  const settingsPath = parsed.values.settings as string | undefined;
+  if (settingsPath !== undefined) {
+    const command = commandName(parsed.positionals);
+    if (command !== "app-server" && command !== "agent-server") {
+      ctx.stderr.write(`${SETTINGS_SCOPE_ERROR}\n`);
+      return 1;
+    }
+  }
+  const standaloneProviders = parsed.values["standalone-providers"] === true;
+  if (standaloneProviders) {
+    const command = commandName(parsed.positionals);
+    if (command !== "app-server" && command !== "agent-server") {
+      ctx.stderr.write(`${STANDALONE_PROVIDERS_SCOPE_ERROR}\n`);
+      return 1;
+    }
+  }
+
   let workingDirectory: string;
   try {
     workingDirectory = resolveCliCwd({
@@ -496,6 +553,8 @@ export const run = async (ctx: RunContext, deps: RunDependencies = {}): Promise<
       toolDisallowlist,
       forceMcs,
       presentationSurface,
+      modelSelection,
+      maxTurns,
     );
   }
 
@@ -512,6 +571,8 @@ export const run = async (ctx: RunContext, deps: RunDependencies = {}): Promise<
       toolDisallowlist,
       forceMcs,
       presentationSurface,
+      modelSelection,
+      maxTurns,
     );
   }
 
@@ -530,6 +591,8 @@ export const run = async (ctx: RunContext, deps: RunDependencies = {}): Promise<
         commandDeps,
         presentationSurface,
         parsed.values["prepare-storage"] === true,
+        settingsPath,
+        standaloneProviders,
       );
     case "doctor":
       return runDoctor(ctx, options, workingDirectory);

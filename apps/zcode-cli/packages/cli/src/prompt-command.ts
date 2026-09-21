@@ -1,5 +1,6 @@
 import { extname } from "node:path";
 import { formatJson, type PresentationSurface } from "@zcode/core";
+import { SessionEventType, type SessionEvent } from "@zcode/contracts";
 import type { RunContext, GlobalOptions } from "@zcode/shared-types";
 import { loadBootstrapModule } from "./bootstrap-loader.js";
 import {
@@ -70,6 +71,8 @@ export const runPrompt = async (
   toolDisallowlist?: readonly string[],
   forceMcs = false,
   presentationSurface: PresentationSurface = "terminal",
+  modelSelection?: string,
+  maxTurns?: number,
 ): Promise<number> => {
   if (prompt.trim().length === 0) {
     ctx.stderr.write(`${EMPTY_PROMPT_ERROR}\n`);
@@ -251,6 +254,12 @@ export const runPrompt = async (
     if (options.memoryBench && !app.runtime.isProjectMemoryEnabled()) {
       throw new Error(MEMORY_BENCH_DISABLED_ERROR);
     }
+    if (modelSelection !== undefined) {
+      // --model 是调用方的显式意图：解析失败（Registry 无此 Provider/Model）必须当场
+      // 失败退出，而不是回退到默认模型静默跑错后端。字符串入口会按 Registry 统一规则
+      // 补默认推理档位（session-facade.ts setModel 的 values.at(-1) 填充）。
+      await app.setModel(modelSelection);
+    }
 
     // 按**可解析性**分流，不按拼写。
     //
@@ -288,7 +297,25 @@ export const runPrompt = async (
     // 挂载点刻意在 command-center 分支**之后**：`/expert`、`/goal` 走不到 submitPrompt，
     // 过去也从不透出事件行，在这里挂就会给那条路径凭空加出 NDJSON 行。
     const subscribeEvents = readRuntimeEventSubscriber(app.runtime);
-    detachEvents = subscribeEvents?.({ onSessionEvent: observer.observe });
+    // --max-turns 的回合上限在 headless 边界实现：core 的 turn 循环没有公开的逐回合
+    // 计数钩子，而事件流里 TurnComplete 恰好一一对应已完成回合。达到上限即 abort
+    // submitPrompt 的信号——进行中的回合按取消收尾，排队输入不再执行。
+    const observeSessionEvent: (event: SessionEvent) => void = (() => {
+      if (maxTurns === undefined) return observer.observe;
+      let completedTurns = 0;
+      return (event) => {
+        observer.observe(event);
+        if (event.type === SessionEventType.TurnComplete) {
+          completedTurns += 1;
+          if (completedTurns >= maxTurns) {
+            abortController.abort(
+              new Error(`--max-turns limit reached (${maxTurns} completed turns)`),
+            );
+          }
+        }
+      };
+    })();
+    detachEvents = subscribeEvents?.({ onSessionEvent: observeSessionEvent });
     const runtimeFacts = readHeadlessRuntimeFacts(app.runtime);
     const result = await app.submitPrompt(
       attachmentPaths.length > 0
@@ -303,7 +330,7 @@ export const runPrompt = async (
       {
         abortSignal: abortController.signal,
         // 常驻订阅装上了就绝不再装 per-turn sink（见上面的单一写者注释）。
-        ...(detachEvents ? {} : { onEvent: observer.observe }),
+        ...(detachEvents ? {} : { onEvent: observeSessionEvent }),
       },
     );
     // 同步紧接着 submitPrompt：这一刻到第一个 await 之间没有任何事件能插队，所以
