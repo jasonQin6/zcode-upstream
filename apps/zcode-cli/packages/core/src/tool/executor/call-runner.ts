@@ -153,6 +153,8 @@ async function executeToolCallImpl(
   }
 
   const mode = deps.getMode();
+  // plan 只读门控与 mode 同源读取（config 支撑的 getPlanEnabled），port 仅作旧组装兼容。
+  const planEnabled = deps.getPlanEnabled() || Boolean(deps.sessionModePort?.isPlanEnabled?.());
 
   if (options?.signal?.aborted) {
     const result = createErrorResult(
@@ -255,7 +257,7 @@ async function executeToolCallImpl(
         ),
         {
           mode,
-          planEnabled: deps.sessionModePort?.isPlanEnabled?.(),
+          planEnabled,
           toolName: canonicalToolCall.name,
         },
       ),
@@ -302,7 +304,7 @@ async function executeToolCallImpl(
       withWorkflowRefineDeniedFollowUp(
         withPlanExitDeniedTurnStop(permissionResult.result, {
           mode,
-          planEnabled: deps.sessionModePort?.isPlanEnabled?.(),
+          planEnabled,
           toolName: canonicalToolCall.name,
         }),
         { toolName: canonicalToolCall.name },

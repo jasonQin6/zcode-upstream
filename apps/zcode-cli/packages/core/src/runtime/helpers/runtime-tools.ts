@@ -13,6 +13,7 @@ import type { AgentRuntimeDeps } from "../types.js";
 import { resolveRuntimeEmbeddedSearchEnabled } from "../methods/embedded-search-branch.js";
 import { getSessionShellSelectionFromConfig } from "../methods/session-shell-environment.js";
 import { createRuntimeSessionModePort } from "../session-mode-port.js";
+import { readRuntimeExecutionState } from "../execution-state.js";
 import { shouldSuppressSealedSubagentBashNotification } from "../../runtime-task/notification-policy.js";
 import {
   resolveBuiltInToolAllowlist,
@@ -217,6 +218,9 @@ function createRuntimeToolExecutor(
     sessionId: runtime.sessionId,
     traceContext: runtime.rootTraceContext,
     getMode: () => runtime.config.mode ?? "build",
+    // plan 是 runtime config 上的既存状态（resolveExecutionState 在构造时归一化写入），
+    // 这里直读配置，使 plan 只读门控不再依赖可选 sessionModePort 的组装完整性。
+    getPlanEnabled: () => readRuntimeExecutionState(runtime).planEnabled,
     maxConcurrency: runtime.config.toolConcurrency?.maxConcurrency,
   });
 }

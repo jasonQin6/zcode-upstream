@@ -79,6 +79,10 @@ export class ToolExecutorImpl implements ToolExecutor {
       runtimeScope: options.runtimeScope ?? "main",
       traceContext: options.traceContext,
       getMode: options.getMode ?? (() => options.mode ?? "build"),
+      // 修复依据：plan 只读门控此前只经可选 sessionModePort 传递，port 缺席的组装
+      // （如 stdio 协议路径）会把 plan 静默退化为 build，写类工具直接放行。
+      // 这里与 getMode 同构：未显式注入时按 mode 值推导，保证门控恒有事实来源。
+      getPlanEnabled: options.getPlanEnabled ?? (() => options.mode === "plan"),
       maxConcurrency: options.maxConcurrency ?? 10,
       hookRunner: options.hookRunner,
     };

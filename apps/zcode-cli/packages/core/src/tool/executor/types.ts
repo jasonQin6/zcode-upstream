@@ -133,6 +133,7 @@ export interface ToolExecutorOptions {
   traceContext?: TraceContext;
   mode?: CollaborationMode;
   getMode?: () => CollaborationMode;
+  getPlanEnabled?: () => boolean;
   maxConcurrency?: number;
   hookRunner?: HookRunner;
 }
@@ -234,6 +235,8 @@ export interface ToolExecutorDeps {
   runtimeScope: ToolRuntimeScope;
   traceContext?: TraceContext;
   getMode: () => CollaborationMode;
+  /** plan 只读门控的事实来源（runtime config.planEnabled）；不依赖可选 sessionModePort。 */
+  getPlanEnabled: () => boolean;
   maxConcurrency: number;
   hookRunner?: HookRunner;
 }
