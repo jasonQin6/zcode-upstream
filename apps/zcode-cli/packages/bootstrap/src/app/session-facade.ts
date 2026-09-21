@@ -458,7 +458,7 @@ export function createSessionFacade(deps: CreateSessionFacadeDeps): SessionFacad
     setModel: async (modelId, options) => {
       // 配置命令已提交完整 Selection；转成字符串会丢档位。先整体校验再一次
       // 更新/保存，非法档位不能留下已换模型的半次修改。旧字符串入口保留只改身份语义。
-      const registrySelection =
+      let registrySelection =
         typeof modelId === "string"
           ? resolveRegistryOwnedSelection(
               deps.providerRegistry,
@@ -470,13 +470,32 @@ export function createSessionFacade(deps: CreateSessionFacadeDeps): SessionFacad
       if (!registrySelection) {
         throw new Error(`Provider Registry 中不存在 Model: ${modelId}`);
       }
+      if (typeof modelId === "string" && !registrySelection.selection.options?.reasoningLevel) {
+        // 修复依据：allowMissingReasoning 只是放行缺失，不补档位——字符串身份入口
+        // 对"必填 reasoning"的模型会在 turn 阶段以 ModelProtocolError "Reasoning
+        // level is required" 失败 (0.16.9 实测)。按仓库统一规则补默认档位
+        // (= values.at(-1)，与 toModelOption / createModelCatalogPort 同源)，
+        // 字符串入口从此可用；对象入口保持严格校验语义不变。
+        const values = registrySelection.model.config.optionSpecs.reasoningLevel?.values;
+        const defaultLevel = values?.at(-1);
+        if (defaultLevel) {
+          registrySelection = {
+            ...registrySelection,
+            selection: {
+              providerId: registrySelection.selection.providerId,
+              modelId: registrySelection.selection.modelId,
+              options: { reasoningLevel: defaultLevel },
+            },
+          };
+        }
+      }
       const previousSelection = deps.runtime.getSessionModelSelection();
       const previousModel = formatLegacyRuntimeModelValue(previousSelection);
       const model = formatLegacyRuntimeModelValue(registrySelection.selection);
       const sessionSelection: ModelSelection = {
         providerId: registrySelection.selection.providerId,
         modelId: registrySelection.selection.modelId,
-        ...(typeof modelId !== "string" && registrySelection.selection.options
+        ...(registrySelection.selection.options
           ? { options: { ...registrySelection.selection.options } }
           : {}),
       };

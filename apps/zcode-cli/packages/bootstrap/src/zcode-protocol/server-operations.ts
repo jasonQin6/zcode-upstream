@@ -1288,7 +1288,17 @@ async function createSessionWithProjection<T>(
     await runSessionModelConfigMutation(record.app, async () => {
       if (initialModel) {
         const setInitialModelStartedAt = Date.now();
-        await record.app.setModel(formatProtocolModelSelection(initialModel));
+        // 修复依据：旧实现把完整 Selection 压成 "provider/model" 身份字符串，
+        // options.reasoningLevel 在 create 阶段被丢弃，首个 turn 以
+        // ModelProtocolError "Reasoning level is required" 失败，客户端被迫
+        // create 后再补一次 session/setModel。与 setModel 处理器同构：
+        // 携带档位时必须整体提交保真；未携带时沿用字符串入口的
+        // allowMissingReasoning 语义（按 Registry 目录补默认档位），兼容旧调用方。
+        await record.app.setModel(
+          initialModel.options?.reasoningLevel
+            ? initialModel
+            : formatProtocolModelSelection(initialModel),
+        );
         setInitialModelDurationMs = Date.now() - setInitialModelStartedAt;
         record.stateRevision++;
       }
