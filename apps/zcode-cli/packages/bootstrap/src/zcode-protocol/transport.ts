@@ -224,10 +224,14 @@ export class ZCodeProtocolNdjsonConnection {
   private shouldBypassProcessingQueue(message: ZCodeProtocolMessage): boolean {
     // 模型任务占住串行队列时，停止/取消请求必须仍能进入 server，
     // 才能把底层 AbortSignal 传给真实模型请求。控制面只旁路当前执行，普通请求仍保持串行。
+    // 修复依据：后台任务取消（含 goal 引擎 turn 的取消）与 session/stop 同属控制面——
+    // 若排在前面的业务 handler 未决（如 goal 状态变更内联等待），取消请求将被串行
+    // 队列永久阻塞，客户端失去唯一的解锁手段。
     return (
       "id" in message &&
       "method" in message &&
       (message.method === zcodeProtocolMethods.sessionStop ||
+        message.method === zcodeProtocolMethods.sessionCancelBackgroundTask ||
         message.method === zcodeProtocolMethods.workspaceCancelGenerateText)
     );
   }

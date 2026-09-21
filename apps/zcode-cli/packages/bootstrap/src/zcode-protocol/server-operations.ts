@@ -2786,7 +2786,12 @@ export async function generateWorkspaceText(
 }
 
 function ensureNoActiveTurn(record: ZCodeProtocolSessionRecord, message: string): void {
-  if (!record.activeAbortController) {
+  // 修复依据：旧实现只看 bootstrap 层的 activeAbortController；该旗标在 turn 的 finally
+  // 中释放，而 runtime 侧（verifier、residency 收尾）可能仍在运行。在这个不一致窗口里
+  // 放行的 goal/compact/fork 调用会内联等待被残余 runtime 工作持有的门控，表现为
+  // 静默挂起（重型 objective 下可复现、持续数分钟）。两个信号任一活跃都按设计语义
+  // 快败 -32010，客户端重试即可，而不是在串行队列里卡死。
+  if (!record.activeAbortController && !record.app.runtime.getActiveTurnInfo()) {
     return;
   }
   throw new ProtocolRequestError(-32010, message);
