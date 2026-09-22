@@ -13,13 +13,22 @@
  *
  * 结构：
  *   - 外层 realm（{@link childMain} 自身）是普通 Node 代码：持有 stdio、readline、vm，负责传输。
- *   - 求值单元是 `vm.createContext(...)` 建的**独立 realm**：只含 ES intrinsics + 注入的 `__host`。
- *     裸 vm context 天然没有 `process`/`require`/`Buffer`/`fetch`；我们只补 `__host` 与运行期禁令。
+ *   - 求值单元是 `vm.createContext(...)` 建的**独立 realm**：只含 ES intrinsics + context 内构造的
+ *     `__host`。裸 vm context 天然没有 `process`/`require`/`Buffer`/`fetch`；我们在 context 内补
+ *     `__host` 与运行期禁令。
  *
- * 跨 realm 收敛（防原型泄漏 / prototype pollution）：脚本触及的一切（Promise、JSON 解析出的
- * host 结果、Error）都在 **context 内**构造；外层与 context 间仅有两种跨界值——一个 `__send(string)`
- * 外层函数，以及入站的行字符串（字符串是原始值，无 realm 归属）。故 `Array.isArray`/`instanceof`/
- * 原型链在脚本视角下全是 context-native，绝不掺入外层 realm 的 intrinsics。
+ * 跨 realm 收敛（防原型泄漏 / prototype pollution / **逃逸**，2026-09-22 沙箱逃逸修复）：脚本触及
+ * 的一切（Promise、JSON 解析出的 host 结果、Error、发件箱）都在 **context 内**构造；外层与
+ * context 间的跨界值只有**字符串原语**——入站的 response 行、`__argsJson`，以及出站方向宿主从
+ * context 原生发件箱 `__outbox` 里逐个读走的行。没有任何外层 realm 的函数或对象递进沙箱。
+ * 为什么纯数据对象也不行：宿主 realm 的任何对象（哪怕一个空数组）一旦被脚本取到，
+ * `x.constructor` 即外层 Array、再 `.constructor` 即外层 Function，`Function("return process")()`
+ * 两跳就是完整进程（实测复现；spec docs/specs/dynamic-workflow/sandbox-boundary.md）。修复前的
+ * 写法 `sandbox.__send = (line) => …` 正是这样被 `__send.constructor("return process")()` 逃逸的；
+ * 删掉它之后还剩最后一条同类链——createContext 的全局代理会沿 sandbox 对象的原型链解析
+ * `globalThis.constructor`，所以 sandbox 必须是 null 原型（见 childMain 内注释）。故
+ * `Array.isArray`/`instanceof`/原型链在脚本视角下全是 context-native，绝不掺入外层 realm 的
+ * intrinsics；逃逸面有常驻探针测试（test/sandbox-boundary.test.ts）。
  *
  * 动态 import：runFn 经 `vm.runInContext`（Script，未提供 importModuleDynamically 回调）编译，
  * 运行期 `import()` 抛 `ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING`。`eval`/`Function` 绑定同一套
@@ -81,18 +90,25 @@ export interface ChildMainDeps {
 export function childMain(deps: ChildMainDeps): Promise<void> {
   /**
    * 在 vm context 内运行的引导脚本（纯 JS，无 backtick / ${}，以便安全内嵌）。
-   * 定义 `__host`（Boundary A shims）、`__deliver`（消费入站 response）、`__execute`（跑 lowered fn），
+   * 定义 `__outbox`（沙箱→宿主的发件箱：**context 原生**数组，宿主只对它做属性读）、
+   * `__host`（Boundary A shims）、`__deliver`（消费入站 response）、`__execute`（跑 lowered fn），
    * 并施加运行期禁令（Date.now / argless new Date() / Math.random）——belt；编译期诊断是 suspenders。
    */
   const BOOTSTRAP = String.raw`
 "use strict";
 
+// 沙箱→宿主的发件箱。**必须在 context 内构造**（2026-09-22 逃逸修复的核心）：
+// 宿主 realm 的任何对象递进沙箱都会经 .constructor.constructor 两跳变成外层 Function（见本
+// 文件顶部），context 原生数组的 Function 则编译落在沙箱内，process 不可达。宿主侧对它只做
+// 属性读（length 与下标元素，元素是 JSON 字符串原语），不调用它的任何方法。
+var __outbox = [];
 var __nextLocal = 0;
 var __nextReq = 0;
 var __pending = new Map();
 
 function __emit(obj) {
-  __send(JSON.stringify(obj));
+  // 属性写发件箱而不是调宿主函数：出站行是 JSON 字符串原语，宿主随后按序冲刷给 stdout。
+  __outbox[__outbox.length] = JSON.stringify(obj);
 }
 
 function __createActor(siteId, name, persona) {
@@ -252,27 +268,61 @@ Math.random = function () {
   // 那个组合下 esbuild 会把**能推导出名字**的内层函数（变量声明 `const send = …`、函数声明、
   // 对象字面量属性）改写成 `__name(fn, "send")`，而 `__name` 是注入在模块作用域的 helper。
   // 它一旦出现在 `toString()` 的文本里，内嵌出的子进程程序就会 ReferenceError——**只在压缩过的
-  // 发布产物里坏**，源码测试全绿。成员赋值（`sandbox.__send = …`）与实参位置的匿名函数不被改写，
+  // 发布产物里坏**，源码测试全绿。成员赋值（如 `pump.drain = …`）与实参位置的匿名函数不被改写，
   // 所以下面一律用这两种形态。验证时需要运行真实打包、压缩后的产物。
 
   const payload = deps.payload;
 
-  // 独立 realm：裸 context 只有 ES intrinsics，注入 __send 传输 + 实参 JSON。
+  // 独立 realm：裸 context 只有 ES intrinsics；跨界仅两类**字符串原语**——入站的 `__argsJson`
+  // 与 `__deliver(line)` 的行。任何外层 realm 的函数/对象都不递入（2026-09-22 逃逸修复，见
+  // 文件顶部；出站方向宿主从 context 原生的 `__outbox` 里属性读）。
+  //
+  // ⚠ sandbox 对象必须 **null 原型**（Object.create(null)）：createContext 的全局代理在自有
+  // 属性未命中时会沿 sandbox 的原型链继续找——普通对象字面量的原型是宿主 Object.prototype，
+  // 脚本取 `globalThis.constructor` 即得宿主 Object、再 `.constructor` 即宿主 Function，
+  // `Function("return process")()` 直达带 env 的宿主进程（探针与独立实验均实测复现——这是
+  // 删掉 `__send` 之后仍残留的最后一条 constructor 链）。null 原型切断该链后，未命中的查找
+  // 落回 context 自身的 Object.prototype，constructor 两跳到的是 context Function；context
+  // 内建（Object/Array/JSON/Promise…）是 context 全局的自有属性，不受影响，bootstrap 写下的
+  // 全局（`__outbox` 等）照常反射到 sandbox 对象上（均有测试钉住）。
   // 实参缺席（内联 run、老 journal 行）编码成 "{}"：`args` 恒有定义是脚本侧的不变式，
   // 沙箱这一侧就是它成立的地方。
-  const sandbox = {
-    __argsJson: JSON.stringify(payload.args ?? {}),
-  } as {
-    __send: (line: string) => void;
+  const sandbox = Object.create(null) as {
     __argsJson: string;
     __deliver: (line: string) => void;
     __execute: (runFn: unknown) => Promise<void>;
+    __outbox?: string[];
   };
-  sandbox.__send = (line) => {
-    deps.stdout.write(`${line}\n`);
-  };
+  sandbox.__argsJson = JSON.stringify(payload.args ?? {});
   deps.vm.createContext(sandbox, { name: "workflow-sandbox" });
   deps.vm.runInContext(BOOTSTRAP, sandbox, { filename: "workflow-bootstrap.js" });
+
+  // bootstrap 之后从 globalThis 取发件箱引用（context 对象出界到宿主是安全方向）。缺席即
+  // bootstrap 未落成不变式——在这里大声抛错比静默丢掉脚本全部输出好：异常冒出 childMain，
+  // 子进程以非零/崩溃收场，父进程按宿主侧故障把 run 结算成可 resume 的 stopped(interrupted)。
+  const outbox = sandbox.__outbox;
+  if (!Array.isArray(outbox)) {
+    throw new Error("workflow sandbox bootstrap did not create the outbox channel");
+  }
+  let consumed = 0;
+  // 发件箱冲刷泵：宿主把沙箱新写的行按序写给 stdout。只做属性读（length 与下标），绝不调用
+  // outbox 的任何方法——跨界纪律在宿主侧同样成立。
+  //
+  // 触发点完备性：`__outbox` 的生产者只有两个入口——`__execute` 首次驱动脚本的同步段及其
+  // 微任务级联、`__deliver` resolve 之后的续体（裸 context 没有 setTimeout/queueMicrotask，
+  // 脚本没有第三种自行苏醒的途径）。setImmediate 保证冲刷发生在本轮微任务排空之后，该轮写入
+  // 的所有行一次带走；stdio 的 FIFO 顺序即父进程 journal 的到达顺序（report / declare-artifact
+  // 的顺序是承重的，见 protocol.ts）。
+  const pump = {} as { drain: () => void };
+  pump.drain = () => {
+    while (consumed < outbox.length) {
+      const line = outbox[consumed];
+      consumed = consumed + 1;
+      if (line !== undefined) {
+        deps.stdout.write(`${line}\n`);
+      }
+    }
+  };
 
   // 编译 lowered 函数体（context-native async fn；其 await 产生 context Promise，import() 无回调将抛错）。
   let runFn: unknown;
@@ -299,17 +349,29 @@ Math.random = function () {
     return Promise.resolve();
   }
 
-  // stdin 持有事件循环存活；每行喂给 context 的 __deliver。
+  // stdin 持有事件循环存活；每行喂给 context 的 __deliver，并排定一次冲刷把 resolve 出的
+  // 续体写下的新行带给父进程。
   const reader = deps.createInterface({ input: deps.stdin });
   reader.on("line", (line: string) => {
     if (!line.trim()) return;
     sandbox.__deliver(line);
+    setImmediate(pump.drain);
   });
 
-  // 跑脚本；收尾时关 stdin，进程随空闲事件循环自然退出（父进程亦会在收到 complete 后 kill）。
-  return sandbox.__execute(runFn).then(
-    () => reader.close(),
-    () => reader.close(),
+  // 跑脚本，先排定初段冲刷（__execute 的同步段与其微任务级联写下的行）；收尾时做最后一次
+  // 同步冲刷——__complete 那行此刻还在发件箱里——再关 stdin。进程随空闲事件循环自然退出，
+  // pending 的 stdout 写会把 complete 送到父进程（父进程亦会在收到 complete 后 kill）。
+  const settled = sandbox.__execute(runFn);
+  setImmediate(pump.drain);
+  return settled.then(
+    () => {
+      pump.drain();
+      reader.close();
+    },
+    () => {
+      pump.drain();
+      reader.close();
+    },
   );
 }
 

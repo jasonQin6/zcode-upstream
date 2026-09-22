@@ -45,6 +45,7 @@ import {
 } from "@zcode/dynamic-workflow";
 import { type ChildMessage, type ChildPayload, type ResponseMessage } from "./protocol.js";
 import { renderChildEntry } from "./child-source.js";
+import { buildChildEnv } from "./child-env.js";
 import { writeChildEntryFile, type HarnessWarning } from "./child-entry-file.js";
 
 /** driver 工厂：harness 先建 sink（引擎的向上回报面），交给工厂造 driver，再以该 driver 建引擎。 */
@@ -89,17 +90,19 @@ export interface RunWorkflowOptions {
   /** 子进程堆上限（MB），映射为 `--max-old-space-size`。缺省 256。 */
   maxOldSpaceSizeMb?: number;
   /**
-   * 子进程 spawn 策略的替代形态：给出时 spawn `process.execPath [...argsPrefix, <entry path>]`，
-   * **不带任何 Node CLI 旗标**。
+   * 子进程 spawn 策略的替代形态。两个旋钮相互独立：
    *
-   * 存在理由：SEA 单文件二进制不解释 Node CLI 旗标，缺省路径的 `--max-old-space-size` 会作为
-   * 普通 token 落进 CLI 的严格 parseArgs 而必然报错退出（每个 workflow run 在 SEA 下都失败）。SEA 下
-   * 由 bootstrap 传入隐藏子命令名作为 argsPrefix，子进程自 re-exec 本二进制并在 parseArgs 之前
-   * `import()` 入口文件、调它的 `start`。
-   *
-   * 代价：堆上限只能由入口文件自己 `v8.setFlagsFromString` best-effort。
+   * - `argsPrefix`：给出时 spawn `<execPath> [...argsPrefix, <entry path>]`，**不带任何 Node CLI
+   *   旗标**。存在理由：SEA 单文件二进制不解释 Node CLI 旗标，缺省路径的 `--max-old-space-size`
+   *   会作为普通 token 落进 CLI 的严格 parseArgs 而必然报错退出（每个 workflow run 在 SEA 下都
+   *   失败）。SEA 下由 bootstrap 传入隐藏子命令名作为 argsPrefix，子进程自 re-exec 本二进制并在
+   *   parseArgs 之前 `import()` 入口文件、调它的 `start`。代价：堆上限只能由入口文件自己
+   *   `v8.setFlagsFromString` best-effort。
+   * - `execPath`：spawn 的可执行文件替代（缺省 `process.execPath`）。测试用它做桌面打包态模拟：
+   *   execPath 指向 Electron 二进制、白名单 env 里的 ELECTRON_RUN_AS_NODE=1 让它按纯 Node 启动
+   *   （缺了那项才会卡在 run-started）。生产恒走缺省。
    */
-  childSpawn?: { argsPrefix: readonly string[] };
+  childSpawn?: { execPath?: string; argsPrefix?: readonly string[] };
   /**
    * 非致命状况的上报口（今日只有一种：入口文件写不进项目 `.zcode/`，回落到了 OS 临时目录）。
    * harness 是 app-free 的，没有 logger；bootstrap 把它接到自己的 warn 日志。
@@ -236,19 +239,18 @@ export async function runWorkflowScript(options: RunWorkflowOptions): Promise<Ru
       ...(options.onWarning === undefined ? {} : { onWarning: options.onWarning }),
     });
     child = spawn(
-      process.execPath,
-      options.childSpawn === undefined
-        ? [`--max-old-space-size=${maxOldSpaceSizeMb}`, entry.path]
-        : [...options.childSpawn.argsPrefix, entry.path],
+      options.childSpawn?.execPath ?? process.execPath,
+      options.childSpawn?.argsPrefix !== undefined
+        ? [...options.childSpawn.argsPrefix, entry.path]
+        : [`--max-old-space-size=${maxOldSpaceSizeMb}`, entry.path],
       {
         cwd,
         stdio: ["pipe", "pipe", "pipe"],
-        // 桌面端 agent 由 Electron Helper 运行（process.execPath 指向 Helper），而 CLI
-        // 启动时会把 ELECTRON_RUN_AS_NODE 从自身 env sanitize 掉。不显式带上它，子进程会按完整
-        // Electron/Chromium 应用启动并卡在 GPU 初始化——永远沉默也不退出，run 卡死在 run-started。
-        // 纯 Node 的 execPath 下该变量无效，无副作用（同 official-plugin-runtime.ts 的处理）。
-        // 两条 spawn 策略都要带：桌面打包态同样可能走 argsPrefix 路径。
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+        // 子进程环境是显式白名单（2026-09-22 修复：过去 {...process.env} 全量继承，CLI 装载的
+        // API key 会随宿主环境进入子进程可枚举面）。逐项必要性与 ELECTRON_RUN_AS_NODE 为什么
+        // 必须恒置 "1"（桌面打包态缺它按完整 Electron 应用启动并静默卡死在 run-started）见
+        // child-env.ts 的集中注释。argsPrefix 与 execPath 两条 spawn 策略共用同一份白名单。
+        env: buildChildEnv(),
       },
     );
   } catch (cause) {

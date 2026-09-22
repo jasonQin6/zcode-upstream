@@ -8,6 +8,7 @@
  */
 
 export { runWorkflowScript, type RunWorkflowOptions, type DriverFactory } from "./harness.js";
+export { buildChildEnv, CHILD_ENV_ALLOWLIST } from "./child-env.js";
 export {
   childMain,
   renderChildEntry,
