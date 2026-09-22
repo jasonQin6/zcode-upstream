@@ -10,6 +10,12 @@
 export { runWorkflowScript, type RunWorkflowOptions, type DriverFactory } from "./harness.js";
 export { buildChildEnv, CHILD_ENV_ALLOWLIST } from "./child-env.js";
 export {
+  isResumable,
+  SETTLEMENT_SEMANTICS,
+  type SettlementRow,
+  type SettlementStatus,
+} from "./settlement-semantics.js";
+export {
   childMain,
   renderChildEntry,
   type ChildMainDeps,

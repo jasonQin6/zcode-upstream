@@ -20,11 +20,13 @@
  *     │◀────── complete(ok,value) ──│  脚本 return
  *     │  engine.complete(value) → settled=completed
  *
- * 失败/取消：run 的裁决归引擎所有。终结失败（脚本抛错 error-complete、子进程崩溃/非零退出、
- * 墙钟超时、子进程行 JSON 解析失败）都调 `engine.fail(error)`（结算 failed + journal failure_json）；
- * abort 信号是唯一的"真取消"，调 `engine.stop(initiator)`（结算 stopped；`signal.reason` 为
- * `"model"` 即主代理 TaskStop，`"interrupted"` 即宿主 App 关闭时停下自己拥有的 run，否则算用户）。引擎自身的 run 级失败
- * （reportCap/inputHash/unknownActor）同样经 engine.settled 冒出。harness 侧的 first-wins
+ * 失败/取消：run 的裁决归引擎所有，终态语义以 **SETTLEMENT_SEMANTICS**
+ * （src/settlement-semantics.ts，表驱动测试逐行锁定）为唯一真源。速览：脚本抛错 →
+ * `failRun`（结算 errored，不可 resume，只能修订）；墙钟超时 / 子进程崩溃 / 协议损坏 /
+ * spawn 失败 → `interruptRun`（结算 stopped(interrupted)，可 resume）；abort 信号按
+ * `signal.reason` 归因经 `engine.stop(initiator)` 结算 stopped（`"model"` / `"user"` /
+ * `"interrupted"` / `{ superseded }`）；引擎自身的 run 级失败（reportCap/inputHash/
+ * unknownActor）与 provider 确定性错误同样经 engine.settled 冒出。harness 侧的 first-wins
  * finalize 只管子进程清理（清 timer、关 stdin、kill child），不自造结算。
  */
 
@@ -84,9 +86,9 @@ export interface RunWorkflowOptions {
   askSpecs: ReadonlyMap<string, AskSpec>;
   /** 注入的 schema 校验器（引擎不 import schema 实现）。 */
   validate: ValidateFn;
-  /** 外部取消信号：中止在飞 ask 并 kill 子进程，run 结算 cancelled。 */
+  /** 外部取消信号：中止在飞 ask 并 kill 子进程；结算 stopped，stop reason 按 abort reason 归因（model/user/interrupted/superseded，见 SETTLEMENT_SEMANTICS）。 */
   signal?: AbortSignal;
-  /** 墙钟超时（ms）：到点 kill 子进程，run 结算 failed。缺省不限。 */
+  /** 墙钟超时（ms）：到点 kill 子进程，结算 stopped(interrupted)，可 resume。缺省不限。 */
   timeoutMs?: number;
   /** 子进程堆上限（MB），映射为 `--max-old-space-size`。缺省 256。 */
   maxOldSpaceSizeMb?: number;
@@ -171,7 +173,8 @@ const STDERR_LIMIT = 64 * 1024;
  * 失败一等公民，但分两类：脚本抛错是脚本之错，
  * 归一成 `{status:"errored", error}`；子进程无法启动 / 崩溃 / 墙钟超时 / 协议损坏是宿主侧故障，
  * 重跑很可能就好，归一成 `{status:"stopped", reason:"interrupted", error}`（可 resume）。
- * 两者都绝不静默吞掉。
+ * 两者都绝不静默吞掉。全部触发条件的终态语义（含 abort 归因与 provider/superseded）见
+ * SETTLEMENT_SEMANTICS（src/settlement-semantics.ts）——本注释只是速览，语义表才是真源。
  */
 export async function runWorkflowScript(options: RunWorkflowOptions): Promise<RunSettlement> {
   const lowered = resolveLowered(options);
@@ -327,14 +330,15 @@ function bridge(deps: BridgeDeps): Promise<RunSettlement> {
       resolve(settlement);
     };
 
-    // 终结失败（脚本抛错 / 子进程崩溃 / 超时 / 协议损坏）都是 run 失败：交给引擎的公有 fail()，
-    // 由它 first-wins 结算、driver 侧取消在飞 ask、journal 记 failed + failure_json——run 的裁决
-    // 归引擎所有，journal 与调用方看到的结果不分叉。子进程清理由 finalize（经 engine.settled）负责。
+    // 脚本之错 / 引擎级失败（语义表 script-error 行）：engine.fail → 结算 errored（不可
+    // resume，只能修订），journal 记 errored + failure_json——run 的裁决归引擎所有，journal
+    // 与调用方看到的结果不分叉。子进程清理由 finalize（经 engine.settled）负责。
     const failRun = (error: WorkflowError): void => {
       if (finalized) return;
       engine.fail(error);
     };
-    // 宿主侧故障（沙箱崩溃 / 超时 / 协议损坏）：stopped(interrupted)，可 resume。
+    // 宿主侧故障（语义表 wall-clock-timeout / child-crashed / ndjson-corrupted 行）：
+    // engine.stop("interrupted") → stopped(interrupted)，可 resume。
     const interruptRun = (message: string, cause?: unknown): void => {
       if (finalized) return;
       engine.stop(
@@ -343,7 +347,8 @@ function bridge(deps: BridgeDeps): Promise<RunSettlement> {
       );
     };
 
-    // abort 是唯一的"真取消"：走 engine.stop(initiator)，结算 stopped。initiator 经
+    // abort 归因各行（语义表 abort-model / abort-interrupted / abort-user / superseded）：
+    // 走 engine.stop(initiator)，结算 stopped。initiator 经
     // `AbortController.abort(reason)` 过来：字面 "model"、amend 路径的
     // `{ superseded: newRunId }`（后继 id 随原因同一笔落库）、字面 "interrupted"（宿主 App
     // 关闭，见下），其余一律 "user"。

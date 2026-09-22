@@ -46,14 +46,26 @@ export interface CapturedDriver {
   /** Boundary C 事件流（run-started / report / run-settled …，到达序）。 */
   events: RunEvent[];
   journal: InMemoryJournalStore;
+  /**
+   * 本 captured 的 driver 工厂：同一 captured（同 journal）经它再次 runWorkflowScript 即是
+   * 引擎语义下的 resume（resume 测试用）。工厂按次接收新 sink，可安全复用。
+   */
+  factory: DriverFactory;
 }
 
 /** 测试用 caps：两条并发上界，足够 fan-out 语义以后复用。 */
 export const TEST_CAPS: Caps = { maxConcurrency: 2 };
 
-export function makeCapturedDriver(): { factory: DriverFactory; captured: CapturedDriver } {
+export function makeCapturedDriver(options: { stopRun?: WorkflowError } = {}): CapturedDriver {
   const journal = new InMemoryJournalStore();
-  const captured: CapturedDriver = { asks: [], worldReads: [], artifacts: [], events: [], journal };
+  const captured: CapturedDriver = {
+    asks: [],
+    worldReads: [],
+    artifacts: [],
+    events: [],
+    journal,
+    factory: () => undefined,
+  } as CapturedDriver;
   const factory: DriverFactory = (sink: WorkflowReportSink): WorkflowDriver => ({
     createActorSession: async (actor) => ({ id: `fake:${actor.siteId}#${actor.ordinal}` }),
     startAsk: (_session, instance, message) => {
@@ -62,6 +74,12 @@ export function makeCapturedDriver(): { factory: DriverFactory; captured: Captur
         ordinal: instance.ordinal,
         instructions: message.instructions,
       });
+      // provider 确定性错误注入：driver 在首个 ask 上报 stopRun，让整个 run 结算为
+      // stopped(provider)——真实语义里这是模型侧错误（认证/配额/套餐）的路径。
+      if (options.stopRun !== undefined) {
+        sink.stopRun(options.stopRun);
+        return;
+      }
       // untyped ask 的最短结算路：turn 一结束即以 finalText 落定。queueMicrotask 让 startAsk
       // 的调用栈先 unwind，模拟"子代理跑了一会儿才回来"的最小异步形态。
       queueMicrotask(() => {
@@ -96,7 +114,8 @@ export function makeCapturedDriver(): { factory: DriverFactory; captured: Captur
       captured.events.push(event);
     },
   });
-  return { factory, captured };
+  captured.factory = factory;
+  return captured;
 }
 
 export interface SandboxRunInput {
@@ -112,6 +131,17 @@ export interface SandboxRunInput {
   argsPrefix?: readonly string[];
   /** 墙钟超时；缺省 15s——探针若意外拿到宿主能力也不会把测试挂死。 */
   timeoutMs?: number;
+  /** runId（缺省 "test-run"；resume 测试用同 runId + 同 journal 两次调用）。 */
+  runId?: string;
+  /** abort 信号注入（结算语义表的 abort 归因各行）。 */
+  signal?: AbortSignal;
+  /** driver 在首个 ask 上报 provider 确定性错误（结算 stopped(provider)）。 */
+  driverStopRun?: WorkflowError;
+  /**
+   * 复用既有 captured（其 journal 一并复用）——resume 测试用：同一 runId + 同一 journal
+   * 第二次 runWorkflowScript 即是引擎语义下的 resume（既有行命中重放）。
+   */
+  captured?: CapturedDriver;
 }
 
 export interface SandboxRunResult {
@@ -121,17 +151,24 @@ export interface SandboxRunResult {
 
 /** 一次完整 run：临时 cwd + 捕获 driver + 公共入口。测试断言返回值，不触内部。 */
 export async function runInSandbox(input: SandboxRunInput): Promise<SandboxRunResult> {
-  const { factory, captured } = makeCapturedDriver();
+  // captured 复用（resume 测试）：同 journal + 同 captured 再跑一次即引擎语义下的 resume。
+  const captured =
+    input.captured ??
+    makeCapturedDriver(
+      ...(input.driverStopRun !== undefined ? [{ stopRun: input.driverStopRun }] : []),
+    );
+  const factory = captured.factory;
   const cwd = await mkdtemp(join(tmpdir(), "dwf-runtime-test-"));
   try {
     const options: RunWorkflowOptions = {
       ...(input.lowered !== undefined ? { lowered: input.lowered } : {}),
       ...(input.scriptText !== undefined ? { scriptText: input.scriptText } : {}),
-      runId: "test-run",
+      runId: input.runId ?? "test-run",
       makeDriver: factory,
       caps: TEST_CAPS,
       askSpecs: input.askSpecs ?? new Map<string, AskSpec>(),
       validate: () => [],
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
       timeoutMs: input.timeoutMs ?? 15_000,
       cwd,
       ...(input.execPath !== undefined || input.argsPrefix !== undefined
@@ -150,27 +187,47 @@ export async function runInSandbox(input: SandboxRunInput): Promise<SandboxRunRe
   }
 }
 
+/** {@link runWithFakeChild} 的附加选项：额外注入项透传 {@link runInSandbox}。 */
+export interface FakeChildOptions extends Partial<SandboxRunInput> {
+  /**
+   * 追加在写行循环之后的**原始脚本体**（测试自担语法）：
+   * - 挂起：`setTimeout(() => {}, 30000);`（事件循环存活，父进程超时/abort 可触达）
+   * - 自杀：`process.kill(process.pid, "SIGKILL");`（崩溃/被杀行）
+   */
+  scriptTail?: string;
+}
+
 /**
- * **子进程行为注入**（wire-protocol-mirror 等 spec 复用的注入手段）：写一个临时"假子进程"
+ * **子进程行为注入**（结算语义、线协议镜像等 spec 复用的注入手段）：写一个临时"假子进程"
  * 脚本，它忽略 harness 附加的真实入口文件参数，只向 stdout 逐行写出 `lines` 里的原始行后
- * 退出。经 `childSpawn.argsPrefix` 注入——spawn 缝与生产完全同形（`node <假脚本> <入口>`），
- * 不 mock harness 内部。
+ * 退出（或按 `scriptTail` 挂起/自杀）。经 `childSpawn.argsPrefix` 注入——spawn 缝与生产
+ * 完全同形（`node <假脚本> <入口>`），不 mock harness 内部。
  *
- * 用途：让父进程分派器收到**真实子进程造不出来**的线消息——未知 kind / 未知事件 type /
- * 坏 NDJSON 行——以验证运行期兜底与分级（可观测 warn vs 中断结算）。
+ * 用途：覆盖真实 lowered 脚本造不出来的线行为——未知 kind、坏 NDJSON 行、挂起触发墙钟
+ * 超时、进程被杀——以驱动结算语义表的各行与运行期兜底。
  */
-export async function runWithFakeChild(lines: string[]): Promise<SandboxRunResult> {
+export async function runWithFakeChild(
+  lines: string[],
+  extra: FakeChildOptions = {},
+): Promise<SandboxRunResult> {
   const dir = await mkdtemp(join(tmpdir(), "dwf-fake-child-"));
   const scriptPath = join(dir, "fake-child.mjs");
+  const { scriptTail, ...sandboxInput } = extra;
   // 行内容由测试逐字给定（合法 JSON 或故意损坏的行都行），这里只负责逐行 + 换行写出。
   await writeFile(
     scriptPath,
-    `const lines = ${JSON.stringify(lines)};\nfor (const line of lines) process.stdout.write(line + "\\n");\n`,
+    `const lines = ${JSON.stringify(lines)};\n` +
+      `for (const line of lines) process.stdout.write(line + "\\n");\n` +
+      `${scriptTail ?? ""}\n`,
     "utf8",
   );
   try {
     // lowered 随便给一个合法体即可：假子进程不会 import 入口文件，真实脚本不执行。
-    return await runInSandbox({ lowered: "return null;", argsPrefix: [scriptPath] });
+    return await runInSandbox({
+      lowered: "return null;",
+      argsPrefix: [scriptPath],
+      ...sandboxInput,
+    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

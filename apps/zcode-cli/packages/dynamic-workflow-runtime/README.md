@@ -23,7 +23,9 @@ const settlement = await runWorkflowScript({
   signal,                     // 可选：AbortSignal
   timeoutMs,                  // 可选：墙钟超时
 });
-// settlement: { status: "completed", artifact } | { status: "failed", error } | { status: "cancelled" }
+// settlement —— 真实词表只有三值：completed | errored | stopped（没有 failed / cancelled）
+// 完整终态语义（触发条件 → status → stop reason → 可否 resume → 通知要点）
+// 以 SETTLEMENT_SEMANTICS（src/settlement-semantics.ts，包内唯一真源，测试逐行锁定）为准
 ```
 
 ## 架构
@@ -49,10 +51,19 @@ world-read）/ `event`（log）/ `complete`；parent→child：`response`。
 `pretypecheck` 会先 `pnpm --filter @zcode/dynamic-workflow build`。全新检出直接 `pnpm test` 即可，
 不会踩到 stale-dist。
 
-## 失败裁决与取舍
+## 结算语义
 
-- run 的裁决归引擎所有。终结失败（脚本抛错 / 子进程崩溃 / 超时 / 协议损坏）都调
-  `engine.fail(error)`——结算 `failed`、driver 侧取消在飞 ask、journal 记 `dwf_run.status =
-  "failed"` + `failure_json`，journal 与调用方看到的结果一致。abort 信号是唯一的"真取消"，
-  调 `engine.cancel()`（结算 `cancelled`，可 resume）。harness 侧的 first-wins finalize 只管
-  子进程清理（清 timer、关 stdin、kill child），不自造结算。
+run 的终态语义以 **`SETTLEMENT_SEMANTICS`**（`src/settlement-semantics.ts`，包内唯一导出
+常量）为唯一真源：每行登记 *触发条件 → 结算 status → stop reason → 可否 resume → 通知
+要点*，被 `test/settlement-semantics.test.ts` 逐行注入锁定——改结算行为必须同时改表与
+测试。速览（详见语义表）：
+
+- 脚本正常 return → `completed`；
+- 脚本抛错 / 引擎级失败（`failRun` 路径）→ `errored`，不可 resume，只能修订（amend-resume）；
+- 其余全部 → `stopped`，可 resume：墙钟超时 / 子进程崩溃 / NDJSON 损坏 / spawn 失败 /
+  宿主关闭（reason `interrupted`）、主代理停止（`model`）、用户停止（`user`）、provider
+  确定性错误（`provider`）；唯一例外是 `superseded`（被修订取代，未完结工作归后继，不可 resume）。
+
+abort 信号驱动的机制是 `engine.stop(initiator)`——引擎**没有** `cancel` 方法；宿主侧故障
+（超时 / 崩溃 / 协议损坏）走的也是 `stop("interrupted")` 而不是 fail。harness 侧的
+first-wins finalize 只管子进程清理（清 timer、关 stdin、kill child），不自造结算。
