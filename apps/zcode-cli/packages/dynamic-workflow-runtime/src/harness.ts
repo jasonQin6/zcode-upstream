@@ -43,8 +43,9 @@ import {
   type WorkflowDriver,
   type WorkflowReportSink,
 } from "@zcode/dynamic-workflow";
-import { type ChildMessage, type ChildPayload, type ResponseMessage } from "./protocol.js";
+import { type ChildMessage, type ChildPayload } from "./protocol.js";
 import { renderChildEntry } from "./child-source.js";
+import { handleChildMessage } from "./wire-dispatch.js";
 import { buildChildEnv } from "./child-env.js";
 import { writeChildEntryFile, type HarnessWarning } from "./child-entry-file.js";
 
@@ -307,6 +308,9 @@ function bridge(deps: BridgeDeps): Promise<RunSettlement> {
   // local#N（child-local 句柄）→ engine ActorId 的映射；stdio FIFO + 同步 create-actor 处理保证
   // 任何引用某句柄的 ask 到达前，该映射已就绪。
   const actorMap = new Map<string, ActorId>();
+  // 未知消息计数：key 是 `field=value`（kind=mystery / event.type=mystery …），值是本 run
+  // 内的累计次数，随每条 warn 事件递增（wire-protocol-mirror spec 的可观测兜底）。
+  const unknownMessageCounts = new Map<string, number>();
   let stderr = "";
   let finalized = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -407,7 +411,7 @@ function bridge(deps: BridgeDeps): Promise<RunSettlement> {
         );
         return;
       }
-      handleChildMessage(message, { engine, actorMap, child, failRun });
+      handleChildMessage(message, { engine, actorMap, child, failRun, unknownMessageCounts });
     });
 
     child.on("error", (error) => {
@@ -424,160 +428,6 @@ function bridge(deps: BridgeDeps): Promise<RunSettlement> {
       interruptRun(reason);
     });
   });
-}
-
-interface MessageDeps {
-  engine: WorkflowEngine;
-  actorMap: Map<string, ActorId>;
-  child: ChildProcess;
-  failRun: (error: WorkflowError) => void;
-}
-
-/** 分发一条 child→parent 消息。ask/world-read 异步桥接到引擎并回 response（搭载最新预算）。 */
-function handleChildMessage(message: ChildMessage, deps: MessageDeps): void {
-  const { engine, actorMap, child, failRun } = deps;
-
-  switch (message.kind) {
-    case "create-actor": {
-      // 同步处理：在任何引用该句柄的 ask 之前把映射建好（stdio FIFO 前提）。createActor 是纯同步的，
-      // 若 run 已结算会同步抛错——此时没有 response 通道，捕获后归为 run 失败（多为无害的收尾竞态）。
-      try {
-        const actorId = engine.createActor(
-          message.siteId,
-          message.name,
-          message.persona as string | undefined,
-        );
-        actorMap.set(message.localId, actorId);
-      } catch (cause) {
-        failRun(
-          cause instanceof WorkflowError
-            ? cause
-            : new WorkflowError("DriverError", `createActor failed at site ${message.siteId}`, {
-                cause,
-              }),
-        );
-      }
-      return;
-    }
-    case "event":
-      // 同步分派，与 log 一致：事件通道的 FIFO 顺序对 report 与 declare-artifact 都是承重的
-      // （父进程 journal 的就是到达的东西，而一条打了标签的 report 必须晚于它的声明落库），
-      // 异步化会让到达顺序与 journal 顺序脱钩。
-      if (message.type === "report") {
-        engine.report(message.siteId, message.item, message.artifactId);
-      } else if (message.type === "declare-artifact") {
-        engine.declareArtifact(message.siteId, message.op, message.args);
-      } else if (message.type === "phase-entered") {
-        engine.enterPhase(message.name);
-      } else {
-        engine.log(message.message);
-      }
-      return;
-    case "complete":
-      if (message.ok) {
-        engine.complete(message.value);
-      } else {
-        // 脚本抛错：run 失败（错误明细来自沙箱）。
-        const err = message.error;
-        failRun(
-          new WorkflowError("DriverError", err?.message ?? "The workflow script threw an error", {
-            cause: err?.stack ?? err?.name,
-          }),
-        );
-      }
-      return;
-    case "request":
-      handleRequest(message, { engine, actorMap, child, failRun });
-      return;
-    default: {
-      const _exhaustive: never = message;
-      void _exhaustive;
-    }
-  }
-}
-
-/** 桥接一次需应答的 host 调用（ask / world-read）到引擎，settle 后回 response。 */
-function handleRequest(
-  message: Extract<ChildMessage, { kind: "request" }>,
-  deps: MessageDeps,
-): void {
-  const { engine, actorMap, child } = deps;
-
-  const respond = (ok: boolean, value: unknown, error?: WorkflowError): void => {
-    const response: ResponseMessage = {
-      kind: "response",
-      id: message.id,
-      ok,
-      ...(ok ? { value } : { error: toWireError(error) }),
-    };
-    // 子进程可能已退出（取消/失败收尾）：仅在可写时写，EPIPE 等 I/O 竞态吞在此边界（run 已在结算）。
-    const stdin = child.stdin;
-    if (stdin === null || !stdin.writable) return;
-    stdin.write(`${JSON.stringify(response)}\n`, () => undefined);
-  };
-
-  let promise: Promise<unknown>;
-  if (message.type === "ask") {
-    const actorId = actorMap.get(message.actor ?? "");
-    if (actorId === undefined) {
-      // 映射缺失（理应不会发生：FIFO 保证）——归一成 UnknownActor 结构化拒绝，不静默。
-      respond(
-        false,
-        undefined,
-        new WorkflowError("UnknownActor", `Unknown subagent handle: ${message.actor}`),
-      );
-      return;
-    }
-    promise = engine.ask(message.siteId, actorId, message.instructions ?? "");
-  } else if (message.type === "publish-artifact") {
-    const op = message.artifactOp;
-    if (op === undefined) {
-      // 缺 op 是接线错误（lowering 恒填它）。**不编一个默认值**：一个被当成 file 处理的
-      // markdown 发布，错误会出现在离故障点很远的地方。归一成结构化拒绝，脚本看得见。
-      respond(
-        false,
-        undefined,
-        new WorkflowError(
-          "DriverError",
-          `publish-artifact request is missing artifactOp (site ${message.siteId})`,
-        ),
-      );
-      return;
-    }
-    promise = engine.publishArtifact(message.siteId, op, message.args ?? []);
-  } else {
-    // op/args 原样转交引擎：本层不看 op、不校验元数（那是 driver 的职责）。缺失 args 归一为空数组，
-    // 让 driver 的实参校验大声拒绝，而不是在这里悄悄编一个默认值。
-    promise = engine.worldRead(message.siteId, message.op ?? "read", message.args ?? []);
-  }
-
-  promise.then(
-    (value) => respond(true, value),
-    (cause: unknown) => {
-      const error =
-        cause instanceof WorkflowError
-          ? cause
-          : new WorkflowError(
-              "DriverError",
-              cause instanceof Error ? cause.message : String(cause),
-              { cause },
-            );
-      respond(false, undefined, error);
-    },
-  );
-}
-
-/** WorkflowError → 线形态（保留 code/violations/finalText，供沙箱脚本 try/catch 结构化处理）。 */
-function toWireError(error: WorkflowError | undefined): ResponseMessage["error"] {
-  if (error === undefined) return { name: "Error", message: "unknown error" };
-  const wire: NonNullable<ResponseMessage["error"]> = {
-    name: error.name,
-    message: error.message,
-    code: error.code,
-  };
-  if (error.violations !== undefined) wire.violations = error.violations;
-  if (error.finalText !== undefined) wire.finalText = error.finalText;
-  return wire;
 }
 
 /** 保留字符串尾部 limit 字节内的内容（stderr 截断）。 */

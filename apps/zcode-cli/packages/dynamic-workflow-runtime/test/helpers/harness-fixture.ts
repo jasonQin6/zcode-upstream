@@ -16,7 +16,7 @@
  *   被测对象），探针文本见 escape-probes.ts。
  */
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -147,6 +147,32 @@ export async function runInSandbox(input: SandboxRunInput): Promise<SandboxRunRe
     return { settlement, captured };
   } finally {
     await rm(cwd, { recursive: true, force: true });
+  }
+}
+
+/**
+ * **子进程行为注入**（wire-protocol-mirror 等 spec 复用的注入手段）：写一个临时"假子进程"
+ * 脚本，它忽略 harness 附加的真实入口文件参数，只向 stdout 逐行写出 `lines` 里的原始行后
+ * 退出。经 `childSpawn.argsPrefix` 注入——spawn 缝与生产完全同形（`node <假脚本> <入口>`），
+ * 不 mock harness 内部。
+ *
+ * 用途：让父进程分派器收到**真实子进程造不出来**的线消息——未知 kind / 未知事件 type /
+ * 坏 NDJSON 行——以验证运行期兜底与分级（可观测 warn vs 中断结算）。
+ */
+export async function runWithFakeChild(lines: string[]): Promise<SandboxRunResult> {
+  const dir = await mkdtemp(join(tmpdir(), "dwf-fake-child-"));
+  const scriptPath = join(dir, "fake-child.mjs");
+  // 行内容由测试逐字给定（合法 JSON 或故意损坏的行都行），这里只负责逐行 + 换行写出。
+  await writeFile(
+    scriptPath,
+    `const lines = ${JSON.stringify(lines)};\nfor (const line of lines) process.stdout.write(line + "\\n");\n`,
+    "utf8",
+  );
+  try {
+    // lowered 随便给一个合法体即可：假子进程不会 import 入口文件，真实脚本不执行。
+    return await runInSandbox({ lowered: "return null;", argsPrefix: [scriptPath] });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 }
 
