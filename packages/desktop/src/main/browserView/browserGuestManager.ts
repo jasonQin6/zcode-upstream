@@ -152,6 +152,12 @@ interface ManagedTab {
   pendingCdpCommands: number;
   /** 命令流空闲释放的计时器；每次 CDP 命令完成后重置，detachGuest 时清除。 */
   guestCdpIdleTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * destroyed-with-cdp 兜底的延迟 rebind 计时器。guest 带着 CDP 被销毁时，旧 DevToolsSession
+   * 的隐式析构与在途通知派发仍在收尾；立刻为换代 guest 挂新 CDP 会叠加第二个 session 的
+   * 派发周期。计时器在 attach / close / dispose 时清除。
+   */
+  guestRebindDelayTimer?: ReturnType<typeof setTimeout>;
   /** re-attach 会话态恢复 flight；业务命令必须 await 它完成才能派发（串行屏障）。 */
   guestCdpRestoreFlight?: Promise<void>;
   /** 当前已持有 viewport 临界区；CDP 重连直接重放，不能再次入队等待自己。 */
@@ -259,6 +265,8 @@ const DEFAULT_GUEST_CDP_TEARDOWN_TIMEOUT_MS = 1_000;
 // CDP 命令流空闲释放阈值：覆盖实测崩溃窗口（turn 内命令间隙 0.4~9s）的同时，
 // 不打断 agent 密集操作流（命令间隔通常远小于该值）。
 const DEFAULT_GUEST_CDP_IDLE_RELEASE_MS = 1_500;
+/** destroyed-with-cdp 后推迟 rebind 的窗口：给旧 session 的在途 native 派发留落地时间。 */
+const GUEST_DESTROYED_REBIND_DELAY_MS = 400;
 const RECORDING_RESULT_TTL_MS = 60 * 60 * 1_000;
 const DEFAULT_BACKGROUND_BROWSER_VIEWPORT: BrowserViewportSize = {
   width: 800,
@@ -715,6 +723,8 @@ export class BrowserGuestManager {
     tab.cdpAttached = cdpAttached;
     tab.guestLifecycle = "attached";
     tab.guestTeardownFlight = undefined;
+    // 新 guest 已绑定，destroyed-with-cdp 的延迟 rebind 不再有意义。
+    this.clearGuestRebindDelay(tab);
     if (!isSameGuest) tab.guestGeneration += 1;
     tab.hasAttachedGuest = true;
     tab.attachFailure = undefined;
@@ -747,7 +757,29 @@ export class BrowserGuestManager {
     guest.once("destroyed", () => {
       const current = this.tabs.get(tabId);
       if (current?.guest === guest) {
+        // detachGuest 会把 cdpAttached 复位，先于它取样。
+        const diedWithCdpAttached = current.cdpAttached;
         this.detachGuest(current);
+        if (diedWithCdpAttached) {
+          // guest 带着已 attach 的 CDP 被销毁：native detach 已无安全窗口，DevToolsSession
+          // 的隐式析构正落在在途通知派发之间。立刻为换代 guest 挂新 CDP 会叠加第二个
+          // session 的派发周期（实测二次周期内主进程崩溃），这里推迟 rebind 并留 warn 级
+          // 痕迹，把 hazard 与具体 tab 生命周期对上。
+          this.warn(
+            `browser guest destroyed with cdp attached tabId=${tab.tabId} ` +
+              `guestId=${safeStr(() => String(guest.id), "?")} hazard=destroyed-with-cdp ` +
+              `rebindDeferredMs=${GUEST_DESTROYED_REBIND_DELAY_MS}`,
+          );
+          this.clearGuestRebindDelay(current);
+          current.guestRebindDelayTimer = setTimeout(() => {
+            current.guestRebindDelayTimer = undefined;
+            const latest = this.tabs.get(tabId);
+            // 延迟期间可能已有新 guest attach（renderer 预建）或 tab 关闭；二者都跳过。
+            if (!latest || latest.lifecycle === "closed" || latest.guest) return;
+            this.requestGuestRebind(latest, "guest-destroyed");
+          }, GUEST_DESTROYED_REBIND_DELAY_MS);
+          return;
+        }
         this.requestGuestRebind(current, "guest-destroyed");
       }
     });
@@ -3033,6 +3065,13 @@ export class BrowserGuestManager {
     }
   }
 
+  private clearGuestRebindDelay(tab: ManagedTab): void {
+    if (tab.guestRebindDelayTimer) {
+      clearTimeout(tab.guestRebindDelayTimer);
+      tab.guestRebindDelayTimer = undefined;
+    }
+  }
+
   closeSession(context: InternalExecutionContext): void {
     this.abortRecordings((entry) => sameScope(entry.context, context), "session closed");
     for (const request of this.runningRequests.values()) {
@@ -3106,6 +3145,7 @@ export class BrowserGuestManager {
     if (tab.lifecycle === "closed") return;
     this.abortRecordings((entry) => entry.tabId === tab.tabId, "tab closed");
     tab.lifecycle = "closed";
+    this.clearGuestRebindDelay(tab);
     this.closedTabIds.add(tab.tabId);
     // tab 已不可再执行命令；不必为一个可能永久不回包的旧 CDP capture 保留 manager 引用。
     this.inFlightScreenshots.delete(tab.tabId);

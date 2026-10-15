@@ -1,6 +1,14 @@
 /* eslint-disable max-lines -- Side pane 当前集中承载 tabs、browser/git/code-viewer 内容；完整拆分需按 pane 功能边界继续推进。 */
 import { ServiceProvider } from "@/hooks/useServices.js";
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type RefObject,
+} from "react";
 import type { PanelImperativeHandle } from "react-resizable-panels";
 import type { IServiceAccessor } from "@zcode/services";
 import {
@@ -134,11 +142,10 @@ function SuspendedBrowserSidePaneContent({
 
   useEffect(() => {
     if (tab.residency !== "suspended") return;
-    // React effect 在旧 UnifiedBrowserView 提交 unmount 后运行；此时回 ack，main 才能安全
-    // 关闭对应 guest WebContents，避免 suspend 被 render-process-gone 当成 crash 立即重建。
-    // info 级打点：挂起换壳会先卸载 <webview>，若卸载瞬间
-    // CDP 仍 attached 即打开主进程 UAF 窗口；这条日志把换壳时刻与 UnifiedBrowserView 的
-    // 卸载打点对齐，用于归因 guest destroyed 的销毁者。
+    // 换壳前置条件（见上方 guestReleasedTabIds）：本会话持有过 guest 的 tab 必须已经
+    // 走完 UnifiedBrowserView 的 CDP 断开握手才允许到达这里，webview 卸载（guest 销毁）
+    // 发生在 main 侧 debugger.detach() 之后。从未渲染过 live 分支的恢复态 tab 没有
+    // session 可断，直接回 ack。
     logger.info("[browser-use] tab 换挂起壳，suspend ready ack", { generation, tabId });
     void platform.browserViewSuspendReady?.({ tabId, generation }).catch((error) => {
       logger.debug("[browser-use] suspend ready ack 失败", {
@@ -454,6 +461,48 @@ export function AnimatedSidePanePanel({
     right: false,
   });
   const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
+  // 挂起换壳握手：webview 离开 DOM 的瞬间 Electron 就地销毁 guest，若 CDP 仍 attach
+  // 即打开主进程 UAF 窗口。挂起 tab 只有在本会话渲染过 live 分支（可能持有 guest）时
+  // 才需要等 UnifiedBrowserView 的 CDP 断开确认；从未渲染过 live 分支的恢复态 tab
+  // 直接换壳，维持「启动恢复不建 guest」的原行为。
+  const [guestReleasedTabIds, setGuestReleasedTabIds] = useState<ReadonlySet<string>>(new Set());
+  const liveBranchTabIdsRef = useRef<ReadonlySet<string>>(new Set());
+  useEffect(() => {
+    const liveIds = tabs
+      .filter(
+        (tab) =>
+          (tab.type === "browser" || tab.type === "browser-use") &&
+          shouldMountBrowserTabGuest(tab),
+      )
+      .map((tab) => tab.id);
+    if (liveIds.length === 0) return;
+    liveBranchTabIdsRef.current = new Set([...liveBranchTabIdsRef.current, ...liveIds]);
+  }, [tabs]);
+  const handleBrowserGuestReleased = useCallback((tabId: string) => {
+    setGuestReleasedTabIds((current) => {
+      if (current.has(tabId)) return current;
+      const next = new Set(current);
+      next.add(tabId);
+      return next;
+    });
+  }, []);
+  // residency 回到 live / tab 关闭后清掉释放标记：下一次挂起必须重新走握手。
+  useEffect(() => {
+    setGuestReleasedTabIds((current) => {
+      if (current.size === 0) return current;
+      const suspendedIds = new Set(
+        tabs
+          .filter(
+            (tab) =>
+              (tab.type === "browser" || tab.type === "browser-use") &&
+              !shouldMountBrowserTabGuest(tab),
+          )
+          .map((tab) => tab.id),
+      );
+      const next = new Set([...current].filter((tabId) => suspendedIds.has(tabId)));
+      return next.size === current.size ? current : next;
+    });
+  }, [tabs]);
   const sidePaneVisibleInlineSizePx = useViewportInlineIntersectionSize(
     panelElementRef,
     hasRenderedSidePane,
@@ -1104,10 +1153,17 @@ export function AnimatedSidePanePanel({
 
                 <div className={cn("relative min-h-0 flex-1 isolate", mobileOverlay && "min-w-0")}>
                   {tabs.map((tab) => {
-                    if (
+                    const suspendRequested =
                       (tab.type === "browser" || tab.type === "browser-use") &&
-                      !shouldMountBrowserTabGuest(tab)
-                    ) {
+                      !shouldMountBrowserTabGuest(tab);
+                    const guestReleaseConfirmed = guestReleasedTabIds.has(tab.id);
+                    // 挂起 tab 若本会话渲染过 live 分支（可能持有 guest），必须等 CDP 断开
+                    // 确认才能换壳；未确认前留在 live 分支（webview 保持挂载）。
+                    const pendingGuestRelease =
+                      suspendRequested &&
+                      liveBranchTabIdsRef.current.has(tab.id) &&
+                      !guestReleaseConfirmed;
+                    if (suspendRequested && !pendingGuestRelease) {
                       return <SuspendedBrowserSidePaneContent key={tab.id} tab={tab} />;
                     }
                     if (tab.type === "browser-use") {
@@ -1130,6 +1186,8 @@ export function AnimatedSidePanePanel({
                           workspacePath={workspaceAbsPath}
                           workspaceIdentity={workspaceIdentity}
                           residencyGeneration={tab.residencyGeneration}
+                          suspendRequested={suspendRequested}
+                          onGuestCdpReleased={() => handleBrowserGuestReleased(tab.id)}
                           onUrlChange={(url) => onBrowserUrlChange(tab.id, url)}
                           onPageMetadataChange={(metadata) =>
                             onBrowserPageMetadataChange(tab.id, metadata)
@@ -1348,6 +1406,8 @@ export function AnimatedSidePanePanel({
                             remoteSessionId={tab.remoteSessionId ?? workspaceRemoteSessionId}
                             residencyGeneration={tab.residencyGeneration}
                             sessionId={tab.ownerTaskId ?? "unscoped"}
+                            suspendRequested={suspendRequested}
+                            onGuestCdpReleased={() => handleBrowserGuestReleased(tab.id)}
                             onUrlChange={(url) => onBrowserUrlChange(tab.id, url)}
                             onPageMetadataChange={(metadata) =>
                               onBrowserPageMetadataChange(tab.id, metadata)

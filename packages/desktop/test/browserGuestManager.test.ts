@@ -1149,6 +1149,81 @@ describe("BrowserGuestManager", () => {
     },
   );
 
+  it("destroyed-with-cdp 推迟 rebind，给旧 session 在途派发留落地窗口", async () => {
+    vi.useFakeTimers();
+    try {
+      const openTabRequests: string[] = [];
+      const { guest } = registerGuest(609);
+      const mgr = new BrowserGuestManager(undefined, undefined, undefined, (tabId) => {
+        openTabRequests.push(tabId);
+      });
+      mgr.attachGuest("rebind-delay", guest.id, { active: false });
+      guest.__emitDestroyed();
+      // guest 带着 CDP 被销毁：立刻为换代 guest 挂新 CDP 会叠加第二个 session 的派发周期。
+      expect(openTabRequests).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(400);
+      expect(openTabRequests).toEqual(["rebind-delay"]);
+      mgr.closeWindow(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("destroyed-with-cdp 延迟窗口内新 guest 已 attach 则跳过补发 rebind", async () => {
+    vi.useFakeTimers();
+    try {
+      const openTabRequests: string[] = [];
+      const old = registerGuest(610);
+      const next = registerGuest(611);
+      const mgr = new BrowserGuestManager(undefined, undefined, undefined, (tabId) => {
+        openTabRequests.push(tabId);
+      });
+      mgr.attachGuest("rebind-skip", old.guest.id, { active: false });
+      old.guest.__emitDestroyed();
+      expect(openTabRequests).toEqual([]);
+
+      // 延迟窗口内 renderer 已重建并 attach 新 guest；迟到的 rebind 必须作废。
+      expect(mgr.attachGuest("rebind-skip", next.guest.id, { active: true }).ok).toBe(true);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(openTabRequests).toEqual([]);
+      mgr.closeWindow(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("CDP 已被空闲释放的 guest 销毁仍立即 rebind，不受延迟兜底影响", async () => {
+    vi.useFakeTimers();
+    try {
+      const openTabRequests: string[] = [];
+      const { guest } = registerGuest(612);
+      const mgr = new BrowserGuestManager(
+        undefined,
+        undefined,
+        undefined,
+        (tabId) => {
+          openTabRequests.push(tabId);
+        },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        1_500,
+      );
+      mgr.attachGuest("rebind-immediate", guest.id, { active: false });
+      // idle 释放后：guest 存活但 CDP 已断，此时销毁没有 UAF 窗口，走原有立即 rebind。
+      await vi.advanceTimersByTimeAsync(1_500);
+      guest.__emitDestroyed();
+      expect(openTabRequests).toEqual(["rebind-immediate"]);
+      mgr.closeWindow(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("普通 fallback 在应用放大、热截图和 idle 重连后共用 raster 与输入补偿", async () => {
     const { guest, spy } = registerGuest(605);
     let desktopZoom = 1.1;

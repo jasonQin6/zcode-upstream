@@ -74,6 +74,8 @@ export function UnifiedBrowserView({
   deferEmptyGuest = false,
   initialHumanViewportPreference,
   onHumanViewportPreferenceChange,
+  suspendRequested = false,
+  onGuestCdpReleased,
 }: {
   /** 受控视图 key（= tab.id / sessionId，agent 定位该 tab 用）。 */
   browserKey: string;
@@ -123,6 +125,13 @@ export function UnifiedBrowserView({
     preference: EmbeddedBrowserViewportPreference,
     source: HumanBrowserViewportPreferenceChangeSource,
   ) => void;
+  /**
+   * 挂起换壳意图：tab residency 已进入 suspended/suspend-pending，但父级在本组件确认
+   * CDP 已断开前不得卸载本组件（webview 离开 DOM 即销毁 guest）。
+   */
+  suspendRequested?: boolean;
+  /** CDP 释放确认回调：握手 ACK 后调用；父级据此才允许把本组件换成挂起壳。 */
+  onGuestCdpReleased?: () => void;
 }): React.JSX.Element {
   const platform = usePlatform();
   const { intl } = useZCodeIntl();
@@ -406,6 +415,44 @@ export function UnifiedBrowserView({
       return false;
     }
   }, [browserKey, platform]);
+
+  // 挂起换壳握手：suspendRequested 到达时先断开 native CDP，再通知父级换壳。
+  // 顺序不能反——renderer 卸载 <webview> 节点的瞬间 Electron 就地销毁 guest，此时
+  // debugger.detach() 已无安全窗口，只能被动接受 DevToolsSession 隐式析构后的 UAF 窗口。
+  // ACK=false 保持常驻（fail-closed）：宁可留下一个 live guest，也不让 <webview> 带着
+  // CDP 被销毁；父级收不到回调就不会换壳。
+  const guestReleaseRequestedRef = useRef(false);
+  const onGuestCdpReleasedRef = useRef(onGuestCdpReleased);
+  onGuestCdpReleasedRef.current = onGuestCdpReleased;
+  useEffect(() => {
+    if (!suspendRequested) {
+      guestReleaseRequestedRef.current = false;
+      return;
+    }
+    if (guestReleaseRequestedRef.current) return;
+    guestReleaseRequestedRef.current = true;
+    if (!lastReportedGuestRef.current) {
+      // 从未上报过 guest 就没有 native session 可断，直接放行换壳。
+      onGuestCdpReleasedRef.current?.();
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const detached = await detachBrowserGuestBeforeReplacement();
+      if (cancelled) return;
+      if (!detached) {
+        // 允许下一次 suspend 意图脉冲重试。
+        guestReleaseRequestedRef.current = false;
+        logger.warn("[browser-use] 挂起前 CDP 断开未确认，保持 webview 常驻", { browserKey });
+        return;
+      }
+      lastReportedGuestRef.current = null;
+      onGuestCdpReleasedRef.current?.();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [browserKey, detachBrowserGuestBeforeReplacement, suspendRequested]);
 
   const {
     cancelPicking: cancelWebElementPicking,
@@ -1015,8 +1062,45 @@ export function UnifiedBrowserView({
   // 就会提前隐藏空置态并裸露 webview。空置态只由已确认导航与加载/错误状态决定。
   const isEmptyBrowserState =
     !hasNavigated && !browserState.isLoading && !browserState.errorMessage;
-  const shouldMountWebview =
+  const rawShouldMountWebview =
     !deferEmptyGuest || isResidencyRestore || hasNavigated || hasInitialNavigation;
+  // 卸载门：raw 条件想把仍有 guest 的 <webview> 摘下时，必须等 CDP 断开握手 ACK。
+  // renderer 直接卸载节点会让 Electron 就地销毁 guest；若 CDP 仍 attach，DevToolsSession
+  // 走隐式析构并在在途通知派发中访问已析构 client（主进程 UAF）。握手失败保持挂载
+  // （fail-closed）：多留一个孤儿 webview 优于打开主进程崩溃窗口。
+  const [webviewReleasePending, setWebviewReleasePending] = useState(false);
+  const prevRawShouldMountWebviewRef = useRef(rawShouldMountWebview);
+  // 翻转检测必须在 render 阶段完成：effect 晚于 commit，而「卸载」正是提交本身——
+  // 等 effect 再 hold 的话 ref-null（节点已摘）先到，门就永久失效。render 阶段的
+  // setState 会让 React 丢弃本次 DOM 输出并立即以 hold 态重渲，webview 不会离开 DOM。
+  if (prevRawShouldMountWebviewRef.current !== rawShouldMountWebview) {
+    prevRawShouldMountWebviewRef.current = rawShouldMountWebview;
+    if (rawShouldMountWebview) {
+      // 重新进入挂载意图，撤销 hold；在途 ACK 之后到达也只是再置一次 false。
+      if (webviewReleasePending) setWebviewReleasePending(false);
+    } else if (webviewTeardownProbeRef.current.hadWebview && !webviewReleasePending) {
+      setWebviewReleasePending(true);
+    }
+  }
+  const shouldMountWebview = rawShouldMountWebview || webviewReleasePending;
+  useEffect(() => {
+    if (!webviewReleasePending) return;
+    let cancelled = false;
+    void (async () => {
+      const detached = await detachBrowserGuestBeforeReplacement();
+      if (cancelled) return;
+      if (!detached) {
+        // fail-closed：保持 hold，webview 继续挂载。
+        logger.warn("[browser-use] 卸载前 CDP 断开未确认，保持 webview 挂载", { browserKey });
+        return;
+      }
+      lastReportedGuestRef.current = null;
+      setWebviewReleasePending(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [browserKey, detachBrowserGuestBeforeReplacement, webviewReleasePending]);
   const prevShouldMountWebviewRef = useRef(shouldMountWebview);
   useEffect(() => {
     const previous = prevShouldMountWebviewRef.current;

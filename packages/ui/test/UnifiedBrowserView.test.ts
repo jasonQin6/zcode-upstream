@@ -792,6 +792,137 @@ describe("UnifiedBrowserView (<webview>)", () => {
     expect(screen.getByText(/killed \(73\)/)).toBeTruthy();
   });
 
+  it("挂起请求先断开 CDP，main ACK 后才允许父级换壳", async () => {
+    const onGuestCdpReleased = vi.fn();
+    const createView = (suspendRequested: boolean) =>
+      createElement(
+        TooltipProvider,
+        null,
+        createElement(UnifiedBrowserView, {
+          browserKey: "browser-use:suspend-1",
+          isVisible: true,
+          sessionId: "task-a",
+          suspendRequested,
+          onGuestCdpReleased,
+        }),
+      );
+    const view = render(createView(false));
+    const webview = stubWebview(screen.getByTestId(TID_BROWSER_WEBVIEW));
+    fireDidAttach(webview);
+    expect(h.attachGuest).toHaveBeenCalledTimes(1);
+
+    let finishDetach: ((detached: boolean) => void) | undefined;
+    const detachCompleted = new Promise<boolean>((resolve) => {
+      finishDetach = resolve;
+    });
+    h.detachGuest.mockReturnValueOnce(detachCompleted);
+    view.rerender(createView(true));
+
+    expect(h.detachGuest).toHaveBeenCalledWith({
+      key: "browser-use:suspend-1",
+      webContentsId: 42,
+    });
+    // ACK 未落定就换壳 = renderer 卸载 webview 时 CDP 仍 attach（主进程 UAF 窗口）。
+    expect(onGuestCdpReleased).not.toHaveBeenCalled();
+
+    await act(async () => {
+      finishDetach?.(true);
+      await detachCompleted;
+    });
+    expect(onGuestCdpReleased).toHaveBeenCalledTimes(1);
+  });
+
+  it("挂起前 CDP 断开被拒时保持常驻，挂起意图重新到达后重试握手", async () => {
+    const onGuestCdpReleased = vi.fn();
+    const createView = (suspendRequested: boolean) =>
+      createElement(
+        TooltipProvider,
+        null,
+        createElement(UnifiedBrowserView, {
+          browserKey: "browser-use:suspend-retry",
+          isVisible: true,
+          sessionId: "task-a",
+          suspendRequested,
+          onGuestCdpReleased,
+        }),
+      );
+    const view = render(createView(false));
+    const webview = stubWebview(screen.getByTestId(TID_BROWSER_WEBVIEW));
+    fireDidAttach(webview);
+
+    h.detachGuest.mockResolvedValueOnce(false);
+    view.rerender(createView(true));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(h.detachGuest).toHaveBeenCalledTimes(1);
+    expect(onGuestCdpReleased).not.toHaveBeenCalled();
+
+    view.rerender(createView(false));
+    view.rerender(createView(true));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(h.detachGuest).toHaveBeenCalledTimes(2);
+    expect(onGuestCdpReleased).toHaveBeenCalledTimes(1);
+  });
+
+  it("未上报过 guest 的挂起请求没有 session 可断，直接放行换壳", () => {
+    const onGuestCdpReleased = vi.fn();
+    render(
+      createElement(
+        TooltipProvider,
+        null,
+        createElement(UnifiedBrowserView, {
+          browserKey: "browser-use:suspend-fresh",
+          isVisible: true,
+          sessionId: "task-a",
+          suspendRequested: true,
+          onGuestCdpReleased,
+        }),
+      ),
+    );
+    expect(h.detachGuest).not.toHaveBeenCalled();
+    expect(onGuestCdpReleased).toHaveBeenCalledTimes(1);
+  });
+
+  it("空置态收起 webview 前先断开 CDP，ACK 前节点保持挂载", async () => {
+    const createView = (isResidencyRestore: boolean) =>
+      createElement(
+        TooltipProvider,
+        null,
+        createElement(UnifiedBrowserView, {
+          browserKey: "browser:release-gate",
+          deferEmptyGuest: true,
+          isResidencyRestore,
+          isVisible: true,
+          sessionId: "task-a",
+        }),
+      );
+    const view = render(createView(true));
+    const webview = stubWebview(screen.getByTestId(TID_BROWSER_WEBVIEW));
+    fireDidAttach(webview);
+
+    let finishDetach: ((detached: boolean) => void) | undefined;
+    const detachCompleted = new Promise<boolean>((resolve) => {
+      finishDetach = resolve;
+    });
+    h.detachGuest.mockReturnValueOnce(detachCompleted);
+    view.rerender(createView(false));
+
+    expect(h.detachGuest).toHaveBeenCalledWith({
+      key: "browser:release-gate",
+      webContentsId: 42,
+    });
+    expect(screen.getByTestId(TID_BROWSER_WEBVIEW)).toBe(webview);
+
+    await act(async () => {
+      finishDetach?.(true);
+      await detachCompleted;
+    });
+    expect(screen.queryByTestId(TID_BROWSER_WEBVIEW)).toBeNull();
+  });
+
   it("证书失败后再输入非法地址，错误态不沿用上一次的证书指引", () => {
     renderView("browser:cert-then-invalid", "task-a");
     const webview = stubWebview(screen.getByTestId(TID_BROWSER_WEBVIEW), {

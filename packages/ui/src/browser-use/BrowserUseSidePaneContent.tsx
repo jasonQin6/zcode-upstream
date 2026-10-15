@@ -16,6 +16,10 @@ export interface BrowserUseSidePaneContentProps {
   workspacePath: string;
   workspaceIdentity?: string;
   residencyGeneration?: number;
+  /** 挂起换壳意图；透传给 UnifiedBrowserView 做 CDP 断开握手。 */
+  suspendRequested?: boolean;
+  /** CDP 释放确认回调；收到后才允许把该 tab 换成挂起壳。 */
+  onGuestCdpReleased?: () => void;
   onUrlChange(url: string): void;
   onPageMetadataChange(metadata: BrowserSidePaneMetadata): void;
 }
@@ -32,6 +36,8 @@ export function BrowserUseSidePaneContent({
   workspacePath,
   workspaceIdentity,
   residencyGeneration,
+  suspendRequested,
+  onGuestCdpReleased,
   onUrlChange,
   onPageMetadataChange,
 }: BrowserUseSidePaneContentProps): React.JSX.Element {
@@ -93,6 +99,8 @@ export function BrowserUseSidePaneContent({
         residencyGeneration={tab.residencyGeneration ?? residencyGeneration}
         browserUseOperationUntil={tab.browserUseOperationUntil}
         browserResizeBaselineVersion={tab.browserUseResizeBaselineVersion}
+        suspendRequested={suspendRequested}
+        onGuestCdpReleased={onGuestCdpReleased}
         onUrlChange={onUrlChange}
         onPageMetadataChange={onPageMetadataChange}
       />
