@@ -431,6 +431,35 @@ test("enables session title generation for TUI sessions", async () => {
   assert.equal(exitCode, 0);
 });
 
+test("headless prompt runs enable workspace hook trust like trusted hosts", async () => {
+  const ctx = createContext(["-p", "hi"]);
+  const exitCode = await run(ctx, {
+    ...createPromptDeps(),
+    createZCodeApp: (options) => {
+      // -p 与 app 会话共享同一份信任库：开关不启用时已授信 hook 被整体硬禁
+      // （workspace_hooks_feature_disabled），CLI 却能写这个库，自相矛盾。
+      assert.equal(options?.workspaceHookTrustEnabled, true);
+      return {
+        getLocale: () => "en-US",
+        getModel: () => "openai/gpt-test",
+        getThoughtLevel: () => "medium",
+        sessionId: "session-test",
+        traceId: "trace-test",
+        runtime: {} as never,
+        submitPrompt: async (prompt: string) => ({
+          events: [],
+          projection: fakeProjection as never,
+          response: prompt,
+          traceId: "trace-test" as never,
+          turnId: "turn-test" as never,
+        }),
+      } as never;
+    },
+  });
+
+  assert.equal(exitCode, 0);
+});
+
 test("passes --disallowedTools into TUI runtime config", async () => {
   const ctx = createContext(["tui", "--disallowedTools", "Bash", "Edit,web_search"]);
   const exitCode = await run(ctx, {

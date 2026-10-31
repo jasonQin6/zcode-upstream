@@ -249,6 +249,12 @@ export const runPrompt = async (
       // 这个最小 broker 只按工具名放行 CreateWorkflow，其余工具委托回同一个 deny
       // broker，语义逐字不变。详见 headless-workflow.ts 的注释。
       permissionBroker: createHeadlessPermissionBroker(),
+      // headless 与 app 会话共享同一份 workspace hook 信任库，但 CLI 入口此前不启用
+      // 信任开关：CLI 自己能写信任库（zcode hooks trust grant），自己的 -p 会话却整体
+      // 硬禁（workspace_hooks_feature_disabled）。按「本地同用户进程」启用后，已授信
+      // hook 生效，未授信 hook 仍逐条 hook_run_blocked 并落到 headless 诊断输出，
+      // 不存在静默执行面；回滚手段与协议入口一致——删掉本字段即回到 hard block。
+      workspaceHookTrustEnabled: true,
       ...(providerEndpointRoutingPort ? { providerEndpointRoutingPort } : {}),
       providerRegistry: providerRegistryRuntime.runtime.registryService,
       configuredDefaultModelSelection: providerRegistryRuntime.configuredDefaultModelSelection,
